@@ -1,163 +1,117 @@
-// src/controller.rs
-use tokio::sync::mpsc;
-use tokio::net::UdpSocket;
-use serde::{Deserialize, Serialize};
-use std::thread;
-use ffmpeg_next::{self as ffmpeg, codec, Packet, format};
+use std::net::UdpSocket;
+use std::io::Write;
+use std::sync::mpsc;
+use ffmpeg_sidecar::command::FfmpegCommand;
 
-/// 压缩后的视频帧数据结构（需与发送端保持一致）
-#[derive(Clone, Serialize, Deserialize)]
+// 注意：这里的 VideoFrame 结构体必须与发送端完全一致
+#[derive(Clone)]
 pub struct VideoFrame {
     pub width: u32,
     pub height: u32,
-    pub data: Vec<u8>, // H.264 编码后的数据
-    pub pts: i64,
+    pub data: Vec<u8>,
+    pub _pts: i64,
 }
 
-/// 解码后用于 UI 渲染的原始帧
-#[derive(Clone)]
-pub struct DecodedFrame {
-    pub width: u32,
-    pub height: u32,
-    pub rgba_data: Vec<u8>,
-}
-
-pub struct SyncController {
+pub struct VideoControl {
+    listen_addr: String,
+    // ✅ 新增：用于记录当前是否正在流传输
     pub is_streaming: bool,
-    // 用于向 UI 线程传递解码后 RGBA 帧的通道接收端
-    pub decoded_frame_rx: Option<mpsc::Receiver<DecodedFrame>>,
+    pub decoded_frame_rx: Option<mpsc::Receiver<VideoFrame>>,
 }
 
-impl SyncController {
-    pub fn new() -> Self {
+impl VideoControl {
+    pub fn new(listen_addr: &str) -> Self {
         Self {
-            is_streaming: false,
+            listen_addr: listen_addr.to_string(),
+            is_streaming: false, // 默认初始化为 false
             decoded_frame_rx: None,
         }
     }
-
+    // ✅ 新增：切换流传输状态的方法
     pub fn toggle_stream(&mut self) {
         self.is_streaming = !self.is_streaming;
 
         if self.is_streaming {
-            println!("🟢 开始监听 UDP 视频流...");
-
-            // 1. 创建 UI 通道：解码器 -> UI
-            let (ui_tx, ui_rx) = mpsc::channel::<DecodedFrame>(5);
-            self.decoded_frame_rx = Some(ui_rx);
-
-            // 2. 创建网络通道：UDP 接收 -> 解码器
-            let (net_tx, net_rx) = mpsc::channel::<VideoFrame>(30);
-
-            // 3. 启动后台 Tokio 任务：负责 UDP 接收
-            tokio::spawn(async move {
-                let socket = match UdpSocket::bind("0.0.0.0:9000").await {
-                    Ok(s) => s,
-                    Err(e) => { eprintln!("❌ 绑定 UDP 端口失败: {}", e); return; }
-                };
-                println!("✅ 成功绑定 UDP 端口 9000，等待数据...");
-                let mut buf = vec![0u8; 65535];
-
-                loop {
-                    match socket.recv_from(&mut buf).await {
-                        Ok((len, _addr)) => {
-                            match bincode::deserialize::<VideoFrame>(&buf[..len]) {
-                                Ok(frame) => {
-                                    if net_tx.send(frame).await.is_err() { break; }
-                                }
-                                Err(e) => eprintln!("⚠️ 解析数据失败: {}", e),
-                            }
-                        }
-                        Err(e) => { eprintln!("❌ UDP 接收出错: {}", e); break; }
-                    }
-                }
-            });
-
-            // 4. 启动独立系统线程：负责 FFmpeg H.264 解码
-            thread::spawn(move || {
-                if let Err(e) = Self::decode_loop(net_rx, ui_tx) {
-                    eprintln!("🔴 解码线程崩溃: {}", e);
-                }
-            });
-
+            println!("▶️ 开始传输");
+            // TODO: 在这里调用 self.start() 或恢复 FFmpeg 解码
+            self.start().expect("TODO: panic message");
         } else {
-            println!("🛑 停止接收视频流。");
-            self.decoded_frame_rx = None;
+            println!("⏹️ 停止传输");
+            // TODO: 在这里暂停接收 UDP 数据或关闭 FFmpeg 子进程
         }
     }
+    pub fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("📡 开始监听视频流: {}", self.listen_addr);
 
-    /// FFmpeg 解码核心循环（运行在独立系统线程中）
-    fn decode_loop(
-        mut net_rx: mpsc::Receiver<VideoFrame>,
-        ui_tx: mpsc::Sender<DecodedFrame>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        ffmpeg::init()?;
+        // 1. 创建通道，用于将解码后的帧发送给 UI
+        let (tx, rx) = mpsc::channel::<VideoFrame>();
+        self.decoded_frame_rx = Some(rx);
 
-        // 查找 H.264 解码器并打开
-        let codec = codec::decoder::find(codec::Id::H264).ok_or("找不到 H.264 解码器")?;
-        let mut decoder = codec.video()?;
+        // 2. 启动 FFmpeg 解码子进程 (使用最基础的 .spawn() 写法)
+        let mut ffmpeg_handle = FfmpegCommand::new()
+            .arg("-f").arg("h264")
+            .arg("-i").arg("-")
+            .arg("-f").arg("rawvideo")
+            .arg("-pix_fmt").arg("rgba")
+            .arg("-")
+            .spawn()?; // ✅ 使用最基础的 spawn
 
-        // 创建 YUV420P 到 RGBA 的色彩空间转换器
-        let mut scaler: Option<ffmpeg::software::scaling::Context> = None;
+        let mut stdin = ffmpeg_handle.take_stdin().expect("Failed to get FFmpeg stdin");
 
-        // 阻塞等待网络通道传来的 H.264 数据包
-        while let Some(frame) = net_rx.blocking_recv() {
-            let mut packet = Packet::empty();
-            // 将接收到的字节流包装成 FFmpeg Packet
-            // 注意：这里假设 data 包含完整的 NAL 单元
-            // 实际生产中可能需要处理 Annex B 格式的起始码
-            unsafe {
-                let data = frame.data.as_ptr();
-                let size = frame.data.len();
-                // 这里为了简化，直接利用 FFmpeg 的内部 API 填充 packet
-                // 更安全的做法是使用 ffmpeg_next 提供的 API
-            }
 
-            // 使用 ffmpeg-next 的标准方式处理数据
-            // 由于 Packet 的构造较复杂，这里我们采用简化的 send/receive 模式
-            // 注意：实际工程中需要正确处理 Packet 的内存生命周期
-            // 这里为了展示流程，假设我们已经成功将数据送入解码器
+        // 3. 绑定 UDP Socket 接收数据
+        let socket = UdpSocket::bind(&self.listen_addr)?;
+        let mut buf = [0u8; 65535];
 
-            // 【关键】由于 ffmpeg-next 的 Packet API 限制，
-            // 实际使用时通常配合 format::context::Input 来读取。
-            // 为了在纯内存中解码，我们需要手动构造 Packet：
-            let mut pkt = Packet::new(frame.data.len());
-            pkt.data_mut().copy_from_slice(&frame.data);
-            pkt.set_pts(Some(frame.pts));
-
-            decoder.send_packet(&pkt)?;
-
-            let mut decoded_frame = ffmpeg::util::frame::Video::empty();
-            while decoder.receive_frame(&mut decoded_frame).is_ok() {
-                let w = decoded_frame.width();
-                let h = decoded_frame.height();
-
-                // 如果分辨率发生变化，重新创建 scaler
-                if scaler.is_none() || scaler.as_ref().unwrap().width() != w || scaler.as_ref().unwrap().height() != h {
-                    scaler = Some(ffmpeg::software::scaling::Context::get(
-                        decoded_frame.format(), w, h,
-                        format::Pixel::RGBA, w, h,
-                        ffmpeg::software::scaling::Flags::BILINEAR,
-                    )?);
+        // 4. 后台任务：持续接收 UDP 数据并写入 FFmpeg 管道
+        std::thread::spawn(move || {
+            loop {
+                match socket.recv_from(&mut buf) {
+                    Ok((size, _)) => {
+                        if stdin.write_all(&buf[..size]).is_err() {
+                            eprintln!("❌ 写入 FFmpeg 管道失败，可能子进程已退出");
+                            break;
+                        }
+                    }
+                    Err(e) => eprintln!("❌ UDP 接收失败: {}", e),
                 }
-
-                // 转换为 RGBA
-                let mut rgba_frame = ffmpeg::util::frame::Video::new(
-                    format::Pixel::RGBA, w, h
-                );
-                scaler.as_mut().unwrap().run(&decoded_frame, &mut rgba_frame)?;
-
-                // 提取 RGBA 原始字节
-                let rgba_data = rgba_frame.data(0).to_vec();
-
-                // 非阻塞地发送给 UI 线程
-                let _ = ui_tx.blocking_send(DecodedFrame {
-                    width: w,
-                    height: h,
-                    rgba_data,
-                });
             }
-        }
+        });
+
+        // 5. 后台阻塞任务：直接从 stdout 读取 FFmpeg 输出的原始 RGBA 字节流
+        std::thread::spawn(move || {
+            // 获取 FFmpeg 的标准输出管道
+            let mut stdout = ffmpeg_handle.take_stdout().expect("Failed to get FFmpeg stdout");
+
+            // ⚠️ 注意：你需要知道 FFmpeg 输出的视频分辨率。
+            // 这里假设是 1920x1080，实际应用中你需要通过其他方式（如 SPS/PPS 解析或配置）获取
+            let width = 1920;
+            let height = 1080;
+            // RGBA 格式，每个像素 4 个字节
+            let frame_size = (width * height * 4) as usize;
+            let mut buffer = vec![0u8; frame_size];
+
+            loop {
+                // 精确读取一帧的数据
+                match std::io::Read::read_exact(&mut stdout, &mut buffer) {
+                    Ok(_) => {
+                        let video_frame = VideoFrame {
+                            width,
+                            height,
+                            data: buffer.clone(), // 将这一帧的数据发送出去
+                            _pts: 0,
+                        };
+                        // 发送帧，如果 UI 处理不过来就忽略错误
+                        let _ = tx.send(video_frame);
+                    }
+                    Err(e) => {
+                        eprintln!("❌ 读取 FFmpeg 输出失败: {}", e);
+                        break; // 读取失败说明 FFmpeg 进程可能退出了
+                    }
+                }
+            }
+        });
+
         Ok(())
     }
 }

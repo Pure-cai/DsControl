@@ -7,8 +7,5 @@ edition = "2024"
 gpui = "0.2.2"
 gpui-component = "0.5.1"
 anyhow = "1.0"
-tokio = { version = "1", features = ["full"] } # 用于后续的网络通信
-xcap = "0.0.8"  # 跨平台屏幕捕获
-bincode = "1.3.3"
-serde = { version = "1.0.228", features = ["derive"] }
-ffmpeg-next = "8.1.1" # 👈 新增 FFmpeg 绑定库
+ffmpeg-sidecar = "2.5.2"
+image = "0.25"      # 用于处理原始图像数据

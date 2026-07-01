@@ -1,48 +1,50 @@
-// src/main.rs
+// 1. 确保模块名称与你的文件名一致
 mod controller;
 
-use controller::{SyncController, VideoFrame};
+use controller::{VideoControl};
 use gpui::*;
-use gpui_component::{button::*, label::Label, *};
+use gpui_component::{button::*, *};
+use gpui_component::label::Label;
+use image::RgbaImage;
 
 pub struct SyncToolApp {
-    controller: SyncController,
-    current_frame: Option<VideoFrame>,
+    controller: VideoControl,
+    current_image: Option<RgbaImage>,
 }
 
 impl Render for SyncToolApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 1. 非阻塞地拉取所有新帧，只保留最新的一帧
+        // ✅ 注意：字段名从 rgba_data 改为了 data，与 controller.rs 保持一致
         if let Some(rx) = &mut self.controller.decoded_frame_rx {
-            // 使用 try_recv 避免阻塞 UI 线程
-            // 如果积压了多帧，只取最新的一帧，丢弃中间的旧帧
             while let Ok(frame) = rx.try_recv() {
-                // 将 frame.rgba_data 更新到你的 GPU 纹理中
-                // 例如：self.texture.update(&frame.rgba_data);
-                println!("收到解码帧: {}x{}", frame.width, frame.height);
+                if let Some(img) = RgbaImage::from_raw(frame.width, frame.height, frame.data) {
+                    self.current_image = Some(img);
+                }
             }
         }
 
-        // 2. 构建视频画面元素 (统一使用 div 作为外层容器)
-        let video_element = if let Some(_frame) = &self.current_frame {
-            // 用 div 包裹 canvas，使其返回类型为 Div
+        // 2. 构建视频画面元素
+        let video_element = if self.current_image.is_some() {
+            // ✅ 临时方案：先画一个带颜色的矩形来验证视频帧是否成功接收
+            // 后续可以替换为真正的 GPU 纹理渲染
             div()
                 .size_full()
                 .child(
                     canvas(
                         |_bounds, _, _| {},
                         |bounds, _, window, _| {
-                            // 绘制一个带颜色的矩形来模拟视频画面
+                            // 绘制一个深灰色矩形作为视频画面占位
                             window.paint_quad(fill(
                                 bounds,
-                                gpui::rgb(0x333333), // 深灰色背景
+                                gpui::rgb(0x333333),
                             ));
                         }
                     )
                         .size_full()
                 )
         } else {
-            // 用 div 包裹占位符，使其返回类型也为 Div
+            // 没有画面时显示占位符
             div()
                 .size_full()
                 .v_flex()
@@ -90,9 +92,17 @@ fn main() {
         gpui_component::init(cx);
         cx.spawn(async move |cx| {
             cx.open_window(WindowOptions::default(), |window, cx| {
+                // ✅ 创建控制器并传入监听地址
+                let mut controller = VideoControl::new("0.0.0.0:8888");
+
+                // ✅ 启动后台接收和解码任务
+                if let Err(e) = controller.start() {
+                    eprintln!("启动视频控制失败: {}", e);
+                }
+
                 let view = cx.new(|_| SyncToolApp {
-                    controller: SyncController::new(),
-                    current_frame: None,
+                    controller,
+                    current_image: None,
                 });
                 cx.new(|cx| Root::new(view, window, cx))
             })?;
