@@ -1,113 +1,105 @@
-// 1. 确保模块名称与你的文件名一致
-mod controller;
-
-use controller::{VideoControl};
 use gpui::*;
-use gpui_component::{button::*, *};
-use gpui_component::label::Label;
-use image::RgbaImage;
+use std::sync::mpsc;
 
-pub struct SyncToolApp {
-    controller: VideoControl,
-    current_image: Option<RgbaImage>,
+// 引入你写好的 VideoReceiver 和 VideoFrame
+mod controller;
+use controller::{VideoReceiver, VideoFrame};
+
+// 定义你的主应用状态结构体
+struct VideoPlayerApp {
+    frame_rx: Option<mpsc::Receiver<VideoFrame>>,
+    current_frame: Option<VideoFrame>, // 缓存当前最新的视频帧
 }
 
-impl Render for SyncToolApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // 1. 非阻塞地拉取所有新帧，只保留最新的一帧
-        // ✅ 注意：字段名从 rgba_data 改为了 data，与 controller.rs 保持一致
-        if let Some(rx) = &mut self.controller.decoded_frame_rx {
+impl VideoPlayerApp {
+    // 初始化方法
+    fn new(frame_rx: mpsc::Receiver<VideoFrame>) -> Self {
+        Self {
+            frame_rx: Some(frame_rx),
+            current_frame: None,
+        }
+    }
+
+    // 处理视频帧更新的方法（由定时器触发）
+    fn poll_video_frame(&mut self, cx: &mut Context<Self>) {
+        if let Some(rx) = &self.frame_rx {
+            // 非阻塞地尝试获取最新的一帧（try_recv 避免阻塞 UI 线程）
+            // 使用循环获取最新帧，丢弃中间积压的旧帧，保证低延迟
             while let Ok(frame) = rx.try_recv() {
-                if let Some(img) = RgbaImage::from_raw(frame.width, frame.height, frame.data) {
-                    self.current_image = Some(img);
-                }
+                self.current_frame = Some(frame);
             }
         }
+        // 通知 GPUI 状态已改变，触发重新渲染
+        cx.notify();
+    }
+}
 
-        // 2. 构建视频画面元素
-        let video_element = if self.current_image.is_some() {
-            // ✅ 临时方案：先画一个带颜色的矩形来验证视频帧是否成功接收
-            // 后续可以替换为真正的 GPU 纹理渲染
-            div()
-                .size_full()
-                .child(
-                    canvas(
-                        |_bounds, _, _| {},
-                        |bounds, _, window, _| {
-                            // 绘制一个深灰色矩形作为视频画面占位
-                            window.paint_quad(fill(
-                                bounds,
-                                gpui::rgb(0x333333),
-                            ));
-                        }
-                    )
-                        .size_full()
-                )
-        } else {
-            // 没有画面时显示占位符
-            div()
-                .size_full()
-                .v_flex()
-                .items_center()
-                .justify_center()
-                .child(Label::new("等待视频流...").text_color(gpui::rgb(0x888888)))
-        };
+// 实现 GPUI 的 Render trait，定义 UI 的渲染逻辑
+impl Render for VideoPlayerApp {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 每次渲染前，尝试拉取最新的视频帧
+        self.poll_video_frame(cx);
 
-        // 3. 组装最终 UI
+        // 使用 gpui-component 的 div 构建布局
         div()
-            .v_flex()
             .size_full()
-            .gap_4()
-            .p_4()
+            .bg(rgb(0x111111)) // 设置深色背景
+            .flex()
             .items_center()
+            .justify_center()
             .child(
-                Label::new("局域网同步控制工具")
-                    .text_xl()
-                    .font_weight(FontWeight::BOLD),
-            )
-            .child(
-                Button::new("stream_btn")
-                    .primary()
-                    .label(if self.controller.is_streaming { "停止传输" } else { "开始传输" })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.controller.toggle_stream();
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .size_full()
-                    .flex_grow()
-                    .bg(gpui::rgb(0x111111))
-                    .rounded_md()
-                    .overflow_hidden()
-                    .child(video_element),
+                if let Some(_frame) = &self.current_frame {
+                    // 💡 核心渲染逻辑：
+                    // 在实际开发中，你需要将 frame.data (RGBA 字节)
+                    // 上传到 GPU 纹理，并使用 gpui 的 img() 或自定义 Canvas 元素进行渲染。
+                    // 这里先使用文本作为占位符，验证数据链路是否打通。
+                    div()
+                        .text_color(gpui::white())
+                        .child(format!(
+                            "🎬 视频流已连接！\n分辨率: {}x{}\n数据大小: {} bytes",
+                            _frame.width,
+                            _frame.height,
+                            _frame.data.len()
+                        ))
+                } else {
+                    div()
+                        .text_color(gpui::white())
+                        .child("📡 正在等待视频流...")
+                }
             )
     }
 }
 
-fn main() {
-    let app = Application::new();
-    app.run(move |cx| {
-        gpui_component::init(cx);
-        cx.spawn(async move |cx| {
-            cx.open_window(WindowOptions::default(), |window, cx| {
-                // ✅ 创建控制器并传入监听地址
-                let mut controller = VideoControl::new("0.0.0.0:8888");
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. 初始化视频接收端
+    let mut receiver = VideoReceiver::new("0.0.0.0:8888");
+    receiver.start()?;
+    let frame_rx = receiver.decoded_frame_rx.take().expect("未找到帧接收通道");
 
-                // ✅ 启动后台接收和解码任务
-                if let Err(e) = controller.start() {
-                    eprintln!("启动视频控制失败: {}", e);
-                }
+    println!("🖥️ GPUI 播放器已就绪...");
 
-                let view = cx.new(|_| SyncToolApp {
-                    controller,
-                    current_image: None,
-                });
-                cx.new(|cx| Root::new(view, window, cx))
-            })?;
-            Ok::<_, anyhow::Error>(())
-        })
-            .detach();
+    // 2. 启动 GPUI 应用
+    Application::new().run(|cx: &mut App| {
+        // 创建应用状态
+        let app_state = VideoPlayerApp::new(frame_rx);
+
+        // 打开主窗口
+        cx.open_window(
+            WindowOptions {
+                //title: Some("Rust GPUI 实时视频播放器".into()),
+                focus: true,
+                ..Default::default()
+            },
+            |_, cx| {
+                // 将状态注册到 GPUI 的上下文中
+                cx.new(|_| app_state)
+            },
+        )
+            .unwrap();
+
+        // 激活窗口
+        cx.activate(true);
     });
+
+    Ok(())
 }
